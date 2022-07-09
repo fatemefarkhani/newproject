@@ -12,6 +12,14 @@ drive.mount('/content/drive')
 
 !pip install transformers
 
+!pip install datasets
+
+! pip install ray[tune]
+
+!pip install pickle5
+
+import pickle5 as pickle
+
 import pandas as pd
 import numpy as np
 import torch
@@ -29,39 +37,97 @@ from torch.nn.utils.rnn import pad_sequence
 from  torch.utils.data import DataLoader
 from urllib.request import urlopen
 
-"""preprocess . . ."""
-
+from transformers import AutoTokenizer, AutoModel,TrainingArguments, Trainer          
+tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 batch_size = 16
 
-from transformers import AutoTokenizer, AutoModel
-
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 model = AutoModel.from_pretrained("bert-base-uncased")
+
+"""preprocess . . ."""
 
 data = pd.read_json('/content/drive/My Drive/json/dataset.json')
 
-atext = data.answerText.values
-qtext = data.questionText.values
-Label = data.label.values
+Data=data.drop(["Qid", "answererID","helpful","answerScore","asin"], axis = 1)
 
-seq_q=qtext.tolist() 
-seq_a=atext.tolist() 
-labels=Label.tolist()
+# Indices of the train and test splits stratified by labels
+train_idx, test_idx = train_test_split(Data,test_size = 0.125,shuffle = True,stratify = Data["label"])
 
-encoded_dict = tokenizer(seq_q, seq_a,padding=True, truncation=True,return_tensors="pt")
+# Indices of the train and validation splits stratified by labels
+train_idx, val_idx = train_test_split(train_idx,test_size = 0.142,shuffle = True,stratify = train_idx["label"])
 
-X_train, X_test, y_train, y_test = train_test_split(encoded_dict, labels, test_size=0.125, random_state=1)
+train_idx.sample(3)
 
-X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.142, random_state=1)
+from datasets import Dataset
+
+train_dataset = Dataset.from_pandas(train_idx)
+test_dataset = Dataset.from_pandas(test_idx)
+val_dataset = Dataset.from_pandas(val_idx)
+
+train_encoded = train_dataset.map(lambda examples: tokenizer(examples['questionText'],examples['answerText'],padding=True,truncation=True), batched=True)
+
+train_encoded.column_names
+
+test_encoded = test_dataset.map(lambda examples: tokenizer(examples['questionText'],examples['answerText'],padding=True,truncation=True), batched=True)
+
+val_encoded = val_dataset.map(lambda examples: tokenizer(examples['questionText'],examples['answerText'],padding=True,truncation=True), batched=True)
+
+train_dataset=train_encoded.remove_columns("questionText")
+train_dataset=train_dataset.remove_columns("answerText")
+
+test_dataset=test_encoded.remove_columns("questionText")
+test_dataset=test_dataset.remove_columns("answerText")
+
+val_dataset=val_encoded.remove_columns("questionText")
+val_dataset=val_dataset.remove_columns("answerText")
+
+train_dataset[0]
 
 args = TrainingArguments(
+    f"bert-base-uncased-finetuned",
     evaluation_strategy = "epoch",
+    save_strategy = "epoch",
     learning_rate=2e-5,
     per_device_train_batch_size=batch_size,
     per_device_eval_batch_size=batch_size,
     num_train_epochs=6,
-    weight_decay=0.01,    
+    weight_decay=0.01,
+    load_best_model_at_end=True,
+    metric_for_best_model="accuracy",    
 )
+
+import datasets
+from datasets import load_metric
+
+metric = load_metric("precision")
+optimizer = torch.optim.Adam(model.parameters(),lr = 2e-5)
+
+def model_init():
+    return AutoModel.from_pretrained("bert-base-uncased")
+
+def compute_metrics(eval_pred):
+    predictions, labels = eval_pred
+    predictions = np.argmax(predictions, axis=1)
+    return metric.compute(predictions=predictions, references=labels)
+
+trainer = Trainer(
+    model_init=model_init,
+    args=args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,    
+    compute_metrics=compute_metrics
+)    
+
+#best_run = trainer.hyperparameter_search(direction="maximize", backend="ray", n_trials=10 )
+
+#for n, v in best_run.hyperparameters.items():
+#    setattr(trainer.args, n, v)
+
+trainer.train()
+
+predicted_results = trainer.predict(test_dataset)
+predicted_labels = predicted_results.predictions.argmax(-1) # Get the highest probability prediction
+predicted_labels = predicted_labels.flatten().tolist()      # Flatten the predictions into a 1D list
+print(classification_report(test_labels,predicted_labels))
 
 """CMLM """
 
